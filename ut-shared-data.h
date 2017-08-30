@@ -25,6 +25,7 @@
 struct ut_info_page {
     uint32_t abi_version;
 
+    uint32_t pid;
     uint32_t tid;
 
     uint32_t sample_size;

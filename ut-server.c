@@ -113,14 +113,20 @@ receive_fd(int socket_fd)
     struct cmsghdr *cmsg;
     int *fd_ptr;
     int fd = -1;
+    int ret;
 
-    if (recvmsg(socket_fd, &msg, 0) < 0)
+    while ((ret = recvmsg(socket_fd, &msg, 0)) < 0 && errno == EINTR)
+        ;
+
+    if (ret < 0) {
         dbg("Failed to receive file descriptor: %m\n");
+        return -1;
+    }
 
     dbg("received message\n");
 
     cmsg = CMSG_FIRSTHDR(&msg);
-    if (cmsg->cmsg_type == SCM_RIGHTS) {
+    if (cmsg && cmsg->cmsg_type == SCM_RIGHTS) {
         struct stat sb;
         uint8_t *buf;
 
@@ -211,11 +217,243 @@ listener_cb(uv_poll_t *handle, int status, int events)
         connect_new_client();
 }
 
+int
+sort_clients_cb(const void *v0, const void *v1)
+{
+    const struct ut_client *c0 = v0;
+    const struct ut_client *c1 = v1;
+
+    if (c0->info->pid == c1->info->pid)
+        return c1->info->tid - c0->info->tid;
+    else
+        return c1->info->pid - c0->info->pid;
+}
+
+typedef enum {
+    JS_OBJ,
+    JS_ARR,
+    JS_STR,
+    JS_NUM,
+    JS_TRUE,
+    JS_FALSE,
+    JS_NULL,
+} jstype;
+
+typedef struct _jsval jsval;
+
+struct _jsval {
+    jstype type;
+
+    union {
+        struct array vals;
+        struct array props;
+        char *str;
+        double num;
+    };
+};
+
+typedef struct {
+    char *name;
+    jsval *val;
+} jsprop;
+
+typedef struct {
+    FILE *file;
+    int indent;
+    bool comma_nl_next;
+    struct array val_stack;
+} jsserializer;
+
+static void
+_json_serialize_val(jsserializer *serializer, jsval *json);
+
+static jsval *
+_json_alloc_val(jsserializer *serializer)
+{
+    int len = serializer->val_stack.len + 1;
+
+    array_set_len(&serializer->val_stack, len + 1);
+
+    return array_value_at(&serializer->val_stack, jsval *, len);
+}
+
+static jsval *
+_json_alloc_prop(jsserializer *serializer)
+{
+    int len = serializer->prop_stack.len + 1;
+
+    array_set_len(&serializer->prop_stack, len + 1);
+
+    return array_value_at(&serializer->prop_stack, jsprop *, len);
+}
+
+static void
+_json_indent(jsserializer *serializer)
+{
+    serializer->indent += 4;
+}
+
+static void
+_json_outdent(jsserializer *serializer)
+{
+    serializer->indent -= 4;
+}
+
+#define js_out(serializer, fmt, ...) do { \
+    if (serializer->comma_nl_next) \
+        fprintf(serializer->file, ",\n"); \
+    fprintf(serializer->file, "%*s" fmt, serializer->indent, #__VA_ARGS__); \
+    serializer->comma_nl_next = false; \
+} while(0)
+
+static void
+_json_serialize_prop(jsserializer *serializer, jsprop *prop)
+{
+    js_out(serializer, "%s: ", prop->name);
+    _json_serialize_val(serializer, prop->val);
+}
+
+static void
+_json_copy_val(jsval *dst, jsval *src)
+{
+    *dst = *src;
+    if (dst->type == JS_STR)
+        dst->str = strdup(src->str);
+}
+
+static void
+js_obj_add_prop(jsserializer *serializer, jsobj *obj)
+{
+    dbg_assert(obj->type == JS_OBJ);
+
+}
+
+static jsval *
+js_append_obj(jsserializer *serializer, jsval *array)
+{
+}
+static jsval *
+js_append_array(jsserializer *serializer, jsval *array, jsval *array_val)
+{
+}
+static jsval *
+js_append_obj(jsserializer *serializer, jsval *array)
+{
+}
+static jsval *
+js_append_num(jsserializer *serializer, jsval *array, double num)
+{
+}
+static jsval *
+js_append_bool(jsserializer *serializer, jsval *array, bool val)
+{
+}
+static jsval *
+js_append_null(jsserializer *serializer, jsval *array)
+{
+}
+
+#define js_val_new(SERIALIZER, VAL_INITIALIZER) \
+    ({ jsval *val = _json_alloc_val(SERIALIZER)); \
+       jsval tmp = VAL_INITIALIZER; _json_copy_val(val, &tmp); val; })
+#define js_prop_new(SERIALIZER, NAME, VAL) \
+    ({ jsprop *prop = _json_alloc_prop(SERIALIZER); \
+       prop->name = strdup(NAME); _json_copy_val(&prop->val, val); prop; })
+
+static void
+_json_serialize_obj(jsserializer *serializer, jsobj *obj)
+{
+    js_out(serializer, "{\n");
+    _json_indent(serializer);
+    for (int i = 0; i < obj->n_props; i++)
+        _json_serialize_prop(serializer, &obj->props[i]);
+    _json_outdent(serializer);
+
+    serializer->comma_nl_next = false;
+    js_out(serializer, "}");
+}
+
+static void
+_json_serialize_array(jsserializer *serializer, jsarr *array)
+{
+    js_out(serializer, "[\n");
+    _json_indent(serializer);
+    for (int i = 0; i < array->len; i++) {
+        _json_serialize_val(serializer, &array->vals[i]);
+    }
+    _json_outdent(serializer);
+
+    serializer->comma_nl_next = false;
+    js_out(serializer, "]");
+}
+
+static void
+_json_serialize_val(jsserializer *serializer, jsval *json)
+{
+    switch(json->type) {
+        case JS_OBJ:
+            _json_serialize_obj(serializer, json->obj);
+            break;
+        case JS_ARR:
+            _json_serialize_array(serializer, json->arr);
+            break;
+        case JS_STR:
+            js_out(serializer, "%s", json->str);
+            break;
+        case JS_NUM:
+            js_out(serializer, "%f", json->num);
+            break;
+        case JS_TRUE:
+            js_out(serializer, "true");
+            break;
+        case JS_FALSE:
+            js_out(serializer, "false");
+            break;
+        case JS_NULL:
+            js_out(serializer, "null");
+            break;
+    }
+
+    serializer->comma_nl_next = true;
+}
+
+static void
+_json_serializer_destroy(jsserializer *serializer)
+{
+    for (int i = 0; i < serializer->val_stack.len; i++) {
+        jsval *val = array_value_at(&serializer->val_stack, jsval *, i);
+        if (val->type == JS_STR)
+            free(val->str);
+    }
+    for (int i = 0; i < serializer->prop_stack.len; i++) {
+        jsprop *prop = array_value_at (&serializer->prop_stack, jsprop *, i);
+        free(prop->name);
+    }
+    array_free(&serializer->val_stack);
+    array_free(&serializer->prop_stack);
+}
+
+static void
+json_serialize(jsval *json)
+{
+    jsserializer serializer = {
+        .file = stdout
+    };
+
+    dbg_assert(json->type == JS_OBJ || json->type == JS_ARR);
+
+    array_init(&serializer->val_stack, sizeof(jsval), 1000);
+    array_init(&serializer->prop_stack, sizeof(jsprop), 1000);
+
+    _json_serialize_val(&serializer, json);
+    _json_serializer_destroy(&serializer);
+}
+
 static void
 capture_data(void)
 {
     struct ut_client *stopped_clients[all_clients.len];
-    int n_stopped_clients;
+    int n_stopped_clients = 0;
 
     for (int i = 0; i < all_clients.len; i++) {
         struct ut_client *client = array_value_at(&all_clients, struct ut_client *, i);
@@ -255,11 +493,52 @@ capture_data(void)
 
     dbg("All clients stopped; ready to read data\n");
 
-    for (int i = 0; i < n_stopped_clients; i++) {
-        struct ut_client *client = array_value_at(&all_clients, struct ut_client *, i);
+    qsort(stopped_clients, n_stopped_clients, sizeof(void *),
+          sort_clients_cb);
 
-        dbg("client n_samples = %d\n", client->info->n_samples_written);
+    jsval json = { 
+        JS_ARR, 
+        .arr = alloca(sizeof(jsarr) + sizeof(jsval) * n_stopped_clients)
     }
+    json.arr->len = n_stopped_clients;
+
+    for (int i = 0; i < n_stopped_clients; i++) {
+        struct ut_client *client = stopped_clients[i];
+        char process_name[128];
+        char thread_name[128];
+        char *filename;
+        jsval *client_json =
+            JS_NEW({ JS_OBJ,
+                     .obj = &(jsobj) {
+                     .n_props = 2,
+                     .props = {
+                     { JS_STR, .str = process_name },
+                     { JS_STR, .str = thread_name },
+                     }
+                     }
+                     });
+        json.arr.vals[i] = client_json;
+
+        
+        asprintf(&filename, "/proc/%d/comm", client->info->pid);
+        ut_read_file_string(filename, process_name, sizeof(process_name));
+        free(filename);
+#error "strings need to be preserved until json_serialize()"
+
+        asprintf(&filename, "/proc/%d/task/%d/comm", client->info->pid, client->info->tid);
+
+        ut_read_file_string(filename, thread_name, sizeof(thread_name));
+        free(filename);
+
+        dbg("client %s:%s n_samples = %d\n",
+            process_name,
+            thread_name,
+            client->info->n_samples_written);
+    }
+
+    json_serialize(&json);
+
+    /* don't explicitly detach, since we're about to exit anyway */
 }
 
 static void

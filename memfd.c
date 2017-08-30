@@ -8,6 +8,8 @@
 #include "ut-utils.h"
 #include "memfd.h"
 
+#define ENABLE_VALGRIND_WORKAROUND
+
 int
 memfd_create(const char *name, unsigned int flags)
 {
@@ -51,7 +53,9 @@ uint8_t *
 memfd_mmap(int mem_fd, size_t size, int prot)
 {
     ftruncate(mem_fd, size);
+#ifndef ENABLE_VALGRIND_WORKAROUND
     fcntl(mem_fd, F_ADD_SEALS, F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_SEAL);
+#endif
 
     dbg("mmap...\n");
     return ut_mmap_real(NULL, size, prot, MAP_SHARED, mem_fd, 0);

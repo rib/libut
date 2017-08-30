@@ -213,7 +213,7 @@ get_thread_state(void)
     pthread_once(&init_tls_once, init_tls_state);
 
     state = pthread_getspecific(tls_key);
-    fprintf(stderr, "getspecific %p\n", state);
+    //fprintf(stderr, "getspecific %p\n", state);
 
     if (unlikely(!state)) {
         int conductor_fd = -1;
@@ -255,6 +255,7 @@ get_thread_state(void)
                     state->info = (void *)mem;
 
                     state->info->abi_version = UT_ABI_VERSION;
+                    state->info->pid = getpid();
                     state->info->tid = get_tid();
                     state->info->sample_size = sizeof(struct ut_sample);
                     state->info->n_samples_written = 0;
@@ -322,6 +323,15 @@ _task_sample(struct thread_state *state,
     uint32_t offset = state->info->n_samples_written * sizeof(struct ut_sample);
     uint32_t mask = (UT_CIRCULAR_BUFFER_SIZE - 1);
     uint32_t cpuid;
+
+#if 0
+    {
+        struct ut_task_desc *desc = array_value_at(&state->task_desc_registry,
+                                                   struct ut_task_desc *,
+                                                   task_desc_index);
+        dbg("sample = %s\n", desc->name);
+    }
+#endif
 
     offset &= mask;
     sample = (void *)(state->buf + offset);

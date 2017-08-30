@@ -182,3 +182,16 @@ array_remove_fast(struct array *array, int idx)
 
 void *
 ut_mmap_real(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
+
+bool
+ut_get_bool_env(const char *var);
+
+int
+ut_read_file(const char *filename, void *buf, int max);
+
+bool
+ut_read_file_string(const char *filename, char *buf, int buf_len);
+
+uint64_t
+ut_read_file_uint64(const char *file);
+
