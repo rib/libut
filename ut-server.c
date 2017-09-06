@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <sys/signalfd.h>
+#include <json.h>
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -16,6 +17,7 @@
 
 #include "ut-utils.h"
 #include "ut-shared-data.h"
+#include "gputop-list.h"
 #include "memfd.h"
 
 #ifdef DEBUG
@@ -27,13 +29,28 @@
 #define dbg(format, ...) do { } while(0)
 #endif
 
+struct ut_ancillary_buffer {
+    gputop_list_t link;
+    int fd;
+    uint8_t *buf;
+    uint32_t buf_size;
+};
+
 struct ut_client {
     int fd;
-    uint32_t tid;
     volatile struct ut_info_page *info;
     volatile struct ut_sample *buf;
+    uint32_t buf_size;
+
+    gputop_list_t ancillary_buffers;
+    struct array task_descriptors;
 
     uv_poll_t poll;
+
+    bool exited;
+
+    char process_name[64];
+    char thread_name[64];
 };
 
 static struct array all_clients;
@@ -115,11 +132,11 @@ receive_fd(int socket_fd)
     int fd = -1;
     int ret;
 
-    while ((ret = recvmsg(socket_fd, &msg, 0)) < 0 && errno == EINTR)
+    while ((ret = recvmsg(socket_fd, &msg, MSG_NOSIGNAL)) < 0 && errno == EINTR)
         ;
 
     if (ret < 0) {
-        dbg("Failed to receive file descriptor: %m\n");
+        dbg("Failed to receive message: %m\n");
         return -1;
     }
 
@@ -133,23 +150,122 @@ receive_fd(int socket_fd)
         fd_ptr = (int *)CMSG_DATA(cmsg);
         fd = *fd_ptr;
         dbg("> received fd = %d\n", fd);
-    } else
+    } else {
+        uint8_t *buf;
         dbg("Expected SCM_RIGHTS cmsg with memfd file descriptor\n");
+        dbg("> msg.msg_iovlen = %d\n", (int)msg.msg_iovlen);
+        buf = msg.msg_iov->iov_base;
+        buf[msg.msg_iov->iov_len - 1] = '\0';
+        dbg("> msg.msg_iov->iov_len = %d;\n", (int)msg.msg_iov->iov_len);
+        dbg("> msg.msg_iov->iov_base = %p = \"%s\";\n", buf, buf);
+        dbg("> msg.msg_controllen = %d\n", (int)msg.msg_controllen);
+        dbg("> msg.msg_flags:\n");
+        if (msg.msg_flags & MSG_EOR)
+            dbg(">   MSG_EOR\n");
+        if (msg.msg_flags & MSG_OOB)
+            dbg(">   MSG_OOB\n");
+        if (msg.msg_flags & MSG_TRUNC)
+            dbg(">   MSG_TRUNC\n");
+        if (msg.msg_flags & MSG_CTRUNC)
+            dbg(">   MSG_CTRUNC\n");
+        dbg("> cmsg = %p\n", cmsg);
+        if (cmsg) {
+            dbg("> cmsg.cmsg_type = %d\n", (int)cmsg->cmsg_type);
+        }
+    }
 
     return fd;
+}
+
+static void
+sever_client(struct ut_client *client)
+{
+    dbg("severing client fd = %d\n", client->fd);
+    uv_poll_stop(&client->poll);
+    close(client->fd);
+    client->exited = true;
+}
+
+static bool
+update_client_names(struct ut_client *client)
+{
+    char filename[64] = { '\0' };
+    char process_name[64] = { '\0' };
+    char thread_name[64] = { '\0' };
+
+    snprintf(filename, sizeof(filename), "/proc/%d/comm", client->info->pid);
+    if (!ut_read_file_string(filename, process_name, sizeof(process_name))) {
+        fprintf(stderr, "> failed to update process name (already exited)\n");
+        return false;
+    }
+
+    strncpy(client->process_name, process_name, sizeof(client->process_name));
+
+    snprintf(filename, sizeof(filename), "/proc/%d/task/%d/comm",
+             client->info->pid, client->info->tid);
+
+    if (!ut_read_file_string(filename, thread_name, sizeof(thread_name))) {
+        fprintf(stderr, "> failed to read thread name (already exited)\n");
+        return false;
+    }
+
+    strncpy(client->thread_name, thread_name, sizeof(client->thread_name));
+
+    return true;
 }
 
 static void
 client_fd_cb(uv_poll_t *handle, int status, int events)
 {
     struct ut_client *client = handle->data;
+    struct ut_ancillary_buffer *ancillary;
     int ancillary_data_fd;
+    struct stat sb;
+    void *buf;
 
-    fprintf(stderr, "client_fd_cb\n");
+    fprintf(stderr, "client_fd_cb: client=%p\n", client);
+    if (!client->info) {
+        fprintf(stderr, "> Spurious client->info == NULL!\n");
+        sever_client(client);
+        return;
+    }
+    fprintf(stderr, "> client thread id = %d\n", client->info->tid);
+
+    if (!update_client_names(client)) {
+        sever_client(client);
+        return;
+    }
+    fprintf(stderr, "> client thread name = \"%s\"\n", client->thread_name);
 
     ancillary_data_fd = receive_fd(client->fd);
+    if (ancillary_data_fd < 0) {
+        sever_client(client);
+        return;
+    }
 
-    dbg("received ancillary data fd for client = %d\n", client->tid);
+    fstat(ancillary_data_fd, &sb);
+    dbg("ancillary buffer size = %d\n", (int)sb.st_size);
+
+    ancillary = xmalloc0(sizeof(*ancillary));
+    ancillary->fd = ancillary_data_fd;
+
+    buf = mmap(NULL, sb.st_size, PROT_READ, MAP_SHARED, ancillary_data_fd, 0);
+    if (!buf) {
+        fprintf(stderr, "Failed to mmap client's ancillary data buffer: %m\n");
+        free(ancillary);
+        close(ancillary_data_fd);
+
+        sever_client(client);
+        return;
+    }
+
+    ancillary->buf = (void *)buf;
+    ancillary->buf_size = sb.st_size;
+
+    dbg("received ancillary data fd for client = %p/tid=%d, size = %d bytes\n",
+        client, client->info->tid, ancillary->buf_size);
+
+    gputop_list_insert(client->ancillary_buffers.prev, &ancillary->link);
 }
 
 static void
@@ -198,9 +314,11 @@ connect_new_client(void)
 
     client->info = (void *)buf;
     client->buf = (void *)(buf + page_size);
+    client->buf_size = sb.st_size - page_size;
 
-    client->tid = client->info->tid;
-    dbg("client thread id = %d\n", client->tid);
+    dbg("client thread id = %d\n", client->info->tid);
+
+    gputop_list_init(&client->ancillary_buffers);
 
     client->poll.data = client;
     uv_poll_init(loop, &client->poll, client_fd);
@@ -220,8 +338,8 @@ listener_cb(uv_poll_t *handle, int status, int events)
 int
 sort_clients_cb(const void *v0, const void *v1)
 {
-    const struct ut_client *c0 = v0;
-    const struct ut_client *c1 = v1;
+    const struct ut_client *c0 = *(struct ut_client **)v0;
+    const struct ut_client *c1 = *(struct ut_client **)v1;
 
     if (c0->info->pid == c1->info->pid)
         return c1->info->tid - c0->info->tid;
@@ -229,224 +347,105 @@ sort_clients_cb(const void *v0, const void *v1)
         return c1->info->pid - c0->info->pid;
 }
 
-typedef enum {
-    JS_OBJ,
-    JS_ARR,
-    JS_STR,
-    JS_NUM,
-    JS_TRUE,
-    JS_FALSE,
-    JS_NULL,
-} jstype;
-
-typedef struct _jsval jsval;
-
-struct _jsval {
-    jstype type;
-
-    union {
-        struct array vals;
-        struct array props;
-        char *str;
-        double num;
-    };
-};
-
-typedef struct {
-    char *name;
-    jsval *val;
-} jsprop;
-
-typedef struct {
-    FILE *file;
-    int indent;
-    bool comma_nl_next;
-    struct array val_stack;
-} jsserializer;
-
 static void
-_json_serialize_val(jsserializer *serializer, jsval *json);
-
-static jsval *
-_json_alloc_val(jsserializer *serializer)
+_js_client_append_ancillary_data(JsonNode *js_client, struct ut_client *client)
 {
-    int len = serializer->val_stack.len + 1;
+    JsonNode *js_ancillary = json_mkarray();
+    struct ut_ancillary_buffer *ancillary;
+    int task_desc_index = 1; /* index 0 reserved */
 
-    array_set_len(&serializer->val_stack, len + 1);
+    gputop_list_for_each(ancillary, &client->ancillary_buffers, link) {
+        for (int i = 0; i < ancillary->buf_size; ) {
+            struct ut_ancillary_record *header = (void *)(ancillary->buf + i);
 
-    return array_value_at(&serializer->val_stack, jsval *, len);
-}
+            if (!header->type)
+                break;
 
-static jsval *
-_json_alloc_prop(jsserializer *serializer)
-{
-    int len = serializer->prop_stack.len + 1;
+            switch (header->type) {
+                case UT_ANCILLARY_TASK_DESC: {
+                    struct ut_shared_task_desc *desc = (void *)(header + 1);
+                    JsonNode *js_record = json_mkobject();
+                    JsonNode *js_record_type = json_mkstring("task-desc");
+                    JsonNode *js_task_name = json_mkstring(desc->name);
+                    JsonNode *js_task_id = json_mknumber(task_desc_index++);
 
-    array_set_len(&serializer->prop_stack, len + 1);
+                    json_append_member(js_record, "type", js_record_type);
+                    json_append_member(js_record, "name", js_task_name);
+                    json_append_member(js_record, "index", js_task_id);
+                    json_append_element(js_ancillary, js_record);
+                    break;
+                }
+            }
 
-    return array_value_at(&serializer->prop_stack, jsprop *, len);
-}
-
-static void
-_json_indent(jsserializer *serializer)
-{
-    serializer->indent += 4;
-}
-
-static void
-_json_outdent(jsserializer *serializer)
-{
-    serializer->indent -= 4;
-}
-
-#define js_out(serializer, fmt, ...) do { \
-    if (serializer->comma_nl_next) \
-        fprintf(serializer->file, ",\n"); \
-    fprintf(serializer->file, "%*s" fmt, serializer->indent, #__VA_ARGS__); \
-    serializer->comma_nl_next = false; \
-} while(0)
-
-static void
-_json_serialize_prop(jsserializer *serializer, jsprop *prop)
-{
-    js_out(serializer, "%s: ", prop->name);
-    _json_serialize_val(serializer, prop->val);
-}
-
-static void
-_json_copy_val(jsval *dst, jsval *src)
-{
-    *dst = *src;
-    if (dst->type == JS_STR)
-        dst->str = strdup(src->str);
-}
-
-static void
-js_obj_add_prop(jsserializer *serializer, jsobj *obj)
-{
-    dbg_assert(obj->type == JS_OBJ);
-
-}
-
-static jsval *
-js_append_obj(jsserializer *serializer, jsval *array)
-{
-}
-static jsval *
-js_append_array(jsserializer *serializer, jsval *array, jsval *array_val)
-{
-}
-static jsval *
-js_append_obj(jsserializer *serializer, jsval *array)
-{
-}
-static jsval *
-js_append_num(jsserializer *serializer, jsval *array, double num)
-{
-}
-static jsval *
-js_append_bool(jsserializer *serializer, jsval *array, bool val)
-{
-}
-static jsval *
-js_append_null(jsserializer *serializer, jsval *array)
-{
-}
-
-#define js_val_new(SERIALIZER, VAL_INITIALIZER) \
-    ({ jsval *val = _json_alloc_val(SERIALIZER)); \
-       jsval tmp = VAL_INITIALIZER; _json_copy_val(val, &tmp); val; })
-#define js_prop_new(SERIALIZER, NAME, VAL) \
-    ({ jsprop *prop = _json_alloc_prop(SERIALIZER); \
-       prop->name = strdup(NAME); _json_copy_val(&prop->val, val); prop; })
-
-static void
-_json_serialize_obj(jsserializer *serializer, jsobj *obj)
-{
-    js_out(serializer, "{\n");
-    _json_indent(serializer);
-    for (int i = 0; i < obj->n_props; i++)
-        _json_serialize_prop(serializer, &obj->props[i]);
-    _json_outdent(serializer);
-
-    serializer->comma_nl_next = false;
-    js_out(serializer, "}");
-}
-
-static void
-_json_serialize_array(jsserializer *serializer, jsarr *array)
-{
-    js_out(serializer, "[\n");
-    _json_indent(serializer);
-    for (int i = 0; i < array->len; i++) {
-        _json_serialize_val(serializer, &array->vals[i]);
-    }
-    _json_outdent(serializer);
-
-    serializer->comma_nl_next = false;
-    js_out(serializer, "]");
-}
-
-static void
-_json_serialize_val(jsserializer *serializer, jsval *json)
-{
-    switch(json->type) {
-        case JS_OBJ:
-            _json_serialize_obj(serializer, json->obj);
-            break;
-        case JS_ARR:
-            _json_serialize_array(serializer, json->arr);
-            break;
-        case JS_STR:
-            js_out(serializer, "%s", json->str);
-            break;
-        case JS_NUM:
-            js_out(serializer, "%f", json->num);
-            break;
-        case JS_TRUE:
-            js_out(serializer, "true");
-            break;
-        case JS_FALSE:
-            js_out(serializer, "false");
-            break;
-        case JS_NULL:
-            js_out(serializer, "null");
-            break;
+            i += header->size;
+        }
     }
 
-    serializer->comma_nl_next = true;
+    json_append_member(js_client, "ancillary", js_ancillary);
 }
 
 static void
-_json_serializer_destroy(jsserializer *serializer)
+_js_client_append_samples(JsonNode *js_client,
+                          struct ut_client *client,
+                          uint64_t *epoch)
 {
-    for (int i = 0; i < serializer->val_stack.len; i++) {
-        jsval *val = array_value_at(&serializer->val_stack, jsval *, i);
-        if (val->type == JS_STR)
-            free(val->str);
+    uint32_t n_samples = client->info->n_samples_written;
+    uint32_t max_samples = client->buf_size / client->info->sample_size;
+    struct ut_sample *samples = (void *)client->buf;
+    JsonNode *js_samples;
+
+    uint32_t tail;
+
+    if (n_samples >= max_samples) {
+        /* XXX: +1 to skip the oldest sample which client might be in
+         * the middle of overwriting... */
+        tail = n_samples - max_samples + 1;
+        tail %= max_samples;
+        n_samples %= max_samples;
+    } else
+        tail = 0;
+
+    js_samples = json_mkarray();
+
+    for (int i = 0; i < n_samples; i++) {
+        uint32_t pos = (tail + i) % max_samples;
+        struct ut_sample *sample = &samples[pos];
+        JsonNode *js_sample, *js_type, *js_cpu, *js_stack_depth, *js_task;
+        JsonNode *js_timestamp;
+        uint64_t progress_ns;
+        double progress_sec;
+
+        if (*epoch == 0)
+            *epoch = sample->timestamp;
+
+        if (sample->timestamp < *epoch)
+            continue;
+
+        js_sample = json_mkobject();
+
+        progress_ns = sample->timestamp - *epoch;
+        progress_sec = (double)progress_ns / 1000000000.0;
+
+        /* XXX: our timestamp isn't guaranteed to git in 53 bits, so we should
+         * probably pick an epoch then track relative to that, discarding
+         * anything earlier
+         */
+        js_type = json_mknumber(sample->type);
+        js_timestamp = json_mknumber(progress_sec);
+        js_cpu = json_mknumber(sample->cpu);
+        js_stack_depth = json_mknumber(sample->stack_pointer);
+        js_task = json_mknumber(sample->task_desc_index);
+
+        json_append_member(js_sample, "type", js_type);
+        json_append_member(js_sample, "timestamp", js_timestamp);
+        json_append_member(js_sample, "cpu", js_cpu);
+        json_append_member(js_sample, "stack_depth", js_stack_depth);
+        json_append_member(js_sample, "task", js_task);
+
+        json_append_element(js_samples, js_sample);
     }
-    for (int i = 0; i < serializer->prop_stack.len; i++) {
-        jsprop *prop = array_value_at (&serializer->prop_stack, jsprop *, i);
-        free(prop->name);
-    }
-    array_free(&serializer->val_stack);
-    array_free(&serializer->prop_stack);
-}
 
-static void
-json_serialize(jsval *json)
-{
-    jsserializer serializer = {
-        .file = stdout
-    };
-
-    dbg_assert(json->type == JS_OBJ || json->type == JS_ARR);
-
-    array_init(&serializer->val_stack, sizeof(jsval), 1000);
-    array_init(&serializer->prop_stack, sizeof(jsprop), 1000);
-
-    _json_serialize_val(&serializer, json);
-    _json_serializer_destroy(&serializer);
+    json_append_member(js_client, "samples", js_samples);
 }
 
 static void
@@ -454,35 +453,61 @@ capture_data(void)
 {
     struct ut_client *stopped_clients[all_clients.len];
     int n_stopped_clients = 0;
+    JsonNode *top;
+    uint64_t epoch = 0;
+    struct ancillary_buffer *ancillary;
 
     for (int i = 0; i < all_clients.len; i++) {
         struct ut_client *client = array_value_at(&all_clients, struct ut_client *, i);
         int ret;
+        int err = 0;
 
-        dbg("interupting client = %d\n", client->tid);
+        dbg("capturing data for client = %p\n", client);
+        if (!client->info) {
+            dbg("> Spurious client->info == NULL\n");
+            continue;
+        }
+
+        dbg("> client thread id = %d\n", client->info->tid);
+
+        update_client_names(client);
+        dbg("> client thread name = \"%s\"\n", client->thread_name);
 
         /* PTRACE_SEIZE + _INTERRUPT gives as a no-side-effect way of stopping
          * the threads we're interested in, and on the offchance that we
          * crash the kernel will automatically resume running the interrupted
          * threads too.
          */
-        ret = ptrace(PTRACE_SEIZE, client->tid, 0, 0);
+        err = 0;
+        ret = ptrace(PTRACE_SEIZE, client->info->tid, 0, 0);
         if (ret < 0) {
-            fprintf(stderr, "ptrace failed to seize tid = %d: %m\n", (int)client->tid);
-            continue;
+            err = errno;
+            if (err == ESRCH) {
+                dbg("PTRACE_SEIZE failed for exited thread\n");
+                client->exited = true;
+            } else {
+                fprintf(stderr, "ptrace failed to seize tid = %d: %m\n",
+                        (int)client->info->tid);
+                continue;
+            }
         }
 
-        ret = ptrace(PTRACE_INTERRUPT, client->tid, 0, 0);
-        if (ret < 0) {
-            fprintf(stderr, "ptrace failed to interrupt tid: %m\n", (int)client->tid);
-            continue;
+        if (!client->exited) {
+            ret = ptrace(PTRACE_INTERRUPT, client->info->tid, 0, 0);
+            if (ret < 0) {
+                fprintf(stderr, "ptrace failed to interrupt tid: %m\n",
+                        (int)client->info->tid);
+                continue;
+            }
+
+            ret = waitid(P_PID, client->info->tid, NULL, WSTOPPED);
+            if (ret < 0) {
+                fprintf(stderr, "failed to wait for thread %d to stop: %m\n",
+                        (int)client->info->tid);
+                continue;
+            }
         }
 
-        ret = waitid(P_PID, client->tid, NULL, WSTOPPED);
-        if (ret < 0) {
-            fprintf(stderr, "failed to wait for thread %d to stop: %m\n", (int)client->tid);
-            continue;
-        }
         stopped_clients[n_stopped_clients++] = client;
     }
 
@@ -496,49 +521,36 @@ capture_data(void)
     qsort(stopped_clients, n_stopped_clients, sizeof(void *),
           sort_clients_cb);
 
-    jsval json = { 
-        JS_ARR, 
-        .arr = alloca(sizeof(jsarr) + sizeof(jsval) * n_stopped_clients)
-    }
-    json.arr->len = n_stopped_clients;
+    top = json_mkarray();
 
     for (int i = 0; i < n_stopped_clients; i++) {
         struct ut_client *client = stopped_clients[i];
-        char process_name[128];
-        char thread_name[128];
-        char *filename;
-        jsval *client_json =
-            JS_NEW({ JS_OBJ,
-                     .obj = &(jsobj) {
-                     .n_props = 2,
-                     .props = {
-                     { JS_STR, .str = process_name },
-                     { JS_STR, .str = thread_name },
-                     }
-                     }
-                     });
-        json.arr.vals[i] = client_json;
+        JsonNode *js_client = json_mkobject();
+        JsonNode *js_process_name, *js_thread_name;
+        JsonNode *js_client_type = json_mkstring("thread");
 
-        
-        asprintf(&filename, "/proc/%d/comm", client->info->pid);
-        ut_read_file_string(filename, process_name, sizeof(process_name));
-        free(filename);
-#error "strings need to be preserved until json_serialize()"
+        json_append_member(js_client, "type", js_client_type);
 
-        asprintf(&filename, "/proc/%d/task/%d/comm", client->info->pid, client->info->tid);
+        js_process_name = json_mkstring(client->process_name);
+        json_append_member(js_client, "name", js_process_name);
 
-        ut_read_file_string(filename, thread_name, sizeof(thread_name));
-        free(filename);
+        js_thread_name = json_mkstring(client->thread_name);
+        json_append_member(js_client, "thread_name", js_thread_name);
 
         dbg("client %s:%s n_samples = %d\n",
-            process_name,
-            thread_name,
+            client->process_name,
+            client->thread_name,
             client->info->n_samples_written);
+
+        _js_client_append_ancillary_data(js_client, client);
+        _js_client_append_samples(js_client, client, &epoch);
+        json_append_element(top, js_client);
     }
 
-    json_serialize(&json);
+    fprintf(stdout, "%s", json_encode(top));
+    json_delete(top);
 
-    /* don't explicitly detach, since we're about to exit anyway */
+    /* don't explicitly detach from ptrace, since we're about to exit anyway */
 }
 
 static void
@@ -576,6 +588,6 @@ main(int argc, char **argv)
     uv_poll_init(loop, &signal_poll, signal_poll_fd);
     uv_poll_start(&signal_poll, UV_READABLE, signal_cb);
 
-    printf("%d listening for clients\n", (int)getpid());
+    fprintf(stderr, "%d listening for clients\n", (int)getpid());
     uv_run(loop, 0);
 }

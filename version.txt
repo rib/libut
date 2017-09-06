@@ -1,0 +1,32 @@
+GLIBC_2.2.5 {
+    global:
+        ut_dlsym_next_untraced;
+
+        mmap;
+        open;
+        read;
+        write;
+        ioctl;
+        nanosleep;
+        send;
+        sendto;
+        sendmsg;
+        recvmsg;
+        pthread_mutex_lock;
+        pthread_mutex_trylock;
+        pthread_mutex_unlock;
+        pthread_cond_wait;
+        pthread_cond_timedwait;
+        pthread_cond_signal;
+        pthread_cond_broadcast;
+    local:
+        *;
+};
+
+GLIBC_2.3.2 {
+    global:
+        pthread_cond_wait;
+        pthread_cond_timedwait;
+        pthread_cond_signal;
+        pthread_cond_broadcast;
+} GLIBC_2.2.5;

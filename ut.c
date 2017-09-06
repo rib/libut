@@ -30,6 +30,7 @@
 #include <sys/prctl.h>
 #include <sys/stat.h>
 
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <pthread.h>
@@ -40,8 +41,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-#include "gputop-list.h"
 #include "ut-utils.h"
+
 #include "memfd.h"
 
 #include "ut.h"
@@ -59,26 +60,16 @@
 #define mb()            __asm__ volatile("mfence" ::: "memory")
 #endif
 
+/* For internal use, to avoid recursion through traced hooks */
+void *ut_mmap_real(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
+int ut_open_real(const char *pathname, int flags, mode_t mode);
+ssize_t ut_read_real(int fd, void *buf, size_t count);
+void *ut_real_malloc(size_t size);
+void *ut_real_realloc(void * ptr, size_t size);
+void ut_real_free(void * ptr);
+ssize_t ut_real_sendmsg(int sockfd, const void * msg, int flags);
+ssize_t ut_real_recvmsg(int socket, void * msg, int flags);
 
-
-#if 0
-task based timing
-
-a task:
-- is tied to a thread
-- begins and ends in the same stack frame
-
-
-per thread state:
-- task stack (we want to draw flame graphs in the end)
-- 
-
-Note: consider that a task might get preemted and switch between cpus
-Use tls and lock-free ring per-thread for capturing traces
-Fixed 2MB ring size
-
-Sampling involves:
-#endif
 
 
 struct thread_state {
@@ -213,7 +204,6 @@ get_thread_state(void)
     pthread_once(&init_tls_once, init_tls_state);
 
     state = pthread_getspecific(tls_key);
-    //fprintf(stderr, "getspecific %p\n", state);
 
     if (unlikely(!state)) {
         int conductor_fd = -1;
@@ -229,26 +219,27 @@ get_thread_state(void)
         conductor_fd = connect_to_abstract_socket("ut-conductor");
         if (conductor_fd >= 0) {
             char thread_name[16];
-            char *shm_name;
+            char shm_name[32];
 
             prctl(PR_GET_NAME, &thread_name);
-            asprintf(&shm_name, "ut-buffer-%s", thread_name);
+            snprintf(shm_name, sizeof(shm_name), "ut-buffer-%s", thread_name);
 
             int mem_fd = memfd_create(shm_name, MFD_CLOEXEC|MFD_ALLOW_SEALING);
             if (mem_fd >= 0) {
-                dbg("mapping circular buffer with size = %d\n", state->buf_size + page_size);
+                dbg("mapping circular buffer with size = %d\n",
+                    state->buf_size + page_size);
 
-
-                uint8_t *mem = memfd_mmap(mem_fd,
-                                          state->buf_size + page_size,
-                                          PROT_READ|PROT_WRITE);
+                uint8_t *mem = ut_mmap_memfd_fd(mem_fd,
+                                                state->buf_size + page_size,
+                                                PROT_READ|PROT_WRITE);
                 {
                     struct stat sb;
                     int ret = fstat(mem_fd, &sb);
                     if (ret < 0) {
                         dbg("Failed to stat memfd file descriptor\n");
                     }
-                    dbg("memfd file size according to fstat() = %d\n", (int)sb.st_size);
+                    dbg("memfd file size according to fstat() = %d\n",
+                        (int)sb.st_size);
                 }
 
                 if (mem) {
@@ -263,7 +254,7 @@ get_thread_state(void)
                     state->buf = mem + page_size;
 
                     fprintf(stderr, "passing circular buffer fd\n");
-                    memfd_pass(conductor_fd, mem_fd);
+                    ut_send_fd(conductor_fd, mem_fd);
 
                     /* Initialize after passing the circular buffer fd, since
                      * this will also pass an fd for the first ancillary data
@@ -338,7 +329,11 @@ _task_sample(struct thread_state *state,
     sample->type = type;
     sample->padding = 0;
     sample->task_desc_index = task_desc_index;
-    sample->tsc = rdtscp(&cpuid);
+    sample->timestamp = read_monotonic_clock();
+    //too much of a faff to open perf event and scale to nanoseconds + manually
+    //correlate PERF_CLOCK with CLOCK_MONOTONIC...
+    //sample->tsc = rdtscp(&cpuid);
+    rdtscp(&cpuid); // only care about cpuid, not tsc, for now
     sample->cpu = cpuid & 0xff;
     //sample->stack_pointer = state->stack_pointer;
     sample->stack_pointer = state->stack.len;
@@ -410,7 +405,6 @@ ut_push_task(struct ut_task_desc *task_desc)
 
     array_append_val(&state->stack, uint16_t, task_desc_idx);
     _task_sample(state, UT_SAMPLE_TASK_PUSH, task_desc_idx);
-    //state->stack_pointer++;
 }
 
 void
@@ -419,8 +413,6 @@ ut_pop_task(struct ut_task_desc *task_desc)
     struct thread_state *state = get_thread_state();
     uint16_t task_desc_idx = get_task_desc_index(state, task_desc);
 
-    //dbg_assert(state->stack_pointer > 0);
-    //state->stack_pointer--;
     _task_sample(state, UT_SAMPLE_TASK_POP, task_desc_idx);
 
     dbg_assert(array_value_at(&state->stack, uint16_t, state->stack.len - 1) == task_desc_idx);

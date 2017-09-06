@@ -25,6 +25,8 @@
 #pragma once
 
 #include <sys/types.h>
+#include <sys/mman.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -58,6 +60,14 @@
 #define UINT_TO_PTR(X) ((void *)((uintptr_t)(X)))
 #define PTR_TO_UINT(X) ((uintptr_t)(X)))
 
+void *ut_untraced_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
+int ut_untraced_open(const char *pathname, int flags, mode_t mode);
+ssize_t ut_untraced_read(int fd, void *buf, size_t count);
+//void *ut_untraced_malloc(size_t size);
+//void *ut_untraced_realloc(void * ptr, size_t size);
+//void ut_untraced_free(void * ptr);
+ssize_t ut_untraced_sendmsg(int sockfd, const void * msg, int flags);
+ssize_t ut_untraced_recvmsg(int socket, void * msg, int flags);
 
 static inline void *
 xmalloc(size_t size)
@@ -180,18 +190,13 @@ array_remove_fast(struct array *array, int idx)
 } while(0)
 
 
-void *
-ut_mmap_real(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
+uint8_t *ut_mmap_memfd_fd(int mem_fd, size_t size, int prot);
 
-bool
-ut_get_bool_env(const char *var);
+void ut_send_fd(int socket_fd, int fd);
 
-int
-ut_read_file(const char *filename, void *buf, int max);
+bool ut_get_bool_env(const char *var);
 
-bool
-ut_read_file_string(const char *filename, char *buf, int buf_len);
-
-uint64_t
-ut_read_file_uint64(const char *file);
+int ut_read_file(const char *filename, void *buf, int max);
+bool ut_read_file_string(const char *filename, char *buf, int buf_len);
+uint64_t ut_read_file_uint64(const char *file);
 

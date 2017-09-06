@@ -39,6 +39,7 @@
  */
 
 #include "memfd.h"
+
 #include "ut-utils.h"
 #include "ut-memfd-array.h"
 
@@ -56,9 +57,9 @@ _stack_alloc_buffer(struct ut_memfd_stack *stack)
     if (stack->current_buf.fd >= 0) {
         stack->current_buf.size = MEMFD_ARRAY_BUF_PAGE_COUNT * page_size;
         stack->current_buf.offset = 0;
-        stack->current_buf.data = memfd_mmap(stack->current_buf.fd,
-                                             stack->current_buf.size,
-                                             PROT_READ|PROT_WRITE);
+        stack->current_buf.data = ut_mmap_memfd_fd(stack->current_buf.fd,
+                                                   stack->current_buf.size,
+                                                   PROT_READ|PROT_WRITE);
         if (!stack->current_buf.data) {
             close(stack->current_buf.fd);
             memset(&stack->current_buf, 0, sizeof(stack->current_buf));
@@ -66,7 +67,7 @@ _stack_alloc_buffer(struct ut_memfd_stack *stack)
         }
 
         dbg("passing ancillary data fd\n");
-        memfd_pass(stack->socket_fd, stack->current_buf.fd);
+        ut_send_fd(stack->socket_fd, stack->current_buf.fd);
     }
 }
 

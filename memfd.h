@@ -2,8 +2,6 @@
 
 #include <linux/memfd.h>
 #include <sys/types.h>
-#include <sys/mman.h>
-#include <stdint.h>
 
 //memfd hacks, as including fcntl or linux/fcntl doesn't appear to work out for me
 #ifndef F_LINUX_SPECIFIC_BASE
@@ -20,11 +18,4 @@
 #define F_SEAL_WRITE    0x0008  /* prevent writes */
 #endif
 
-int
-memfd_create(const char *name, unsigned int flags);
-
-void
-memfd_pass(int socket_fd, int fd);
-
-uint8_t *
-memfd_mmap(int mem_fd, size_t size, int prot);
+int memfd_create(const char *name, unsigned int flags);

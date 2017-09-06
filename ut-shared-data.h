@@ -35,7 +35,6 @@ struct ut_info_page {
 enum ut_sample_type {
     UT_SAMPLE_TASK_PUSH = 1,
     UT_SAMPLE_TASK_POP,
-    MAX_UT_SAMPLE_TYPES
 };
 
 /* Note: all samples in the circular buffer have the same size which allows
@@ -57,13 +56,13 @@ struct ut_sample {
     uint8_t cpu;
     uint8_t padding;
 
-    uint64_t tsc;
+    //uint64_t tsc;
+    uint64_t timestamp;
 } __attribute__((aligned(8)));
 
 
 enum ut_ancillary_record_type {
     UT_ANCILLARY_TASK_DESC = 1,
-    MAX_UT_ANCILLARY_RECORD_TYPE,
 };
 
 struct ut_ancillary_record {
