@@ -5,7 +5,6 @@
 /*
  * TODO:
  *
- * - introduce a left margin size for process + thread labels
  * - insert axis for details
  * - align process/thread names with trace
  * - test with trace that has multiple stack frames
@@ -22,12 +21,16 @@
  *      - select
  *      - epoll_wait
  *      - malloc (only larger allocations)
- *      - pthread apis that might block
  */
 
 var threads = [];
 var timestamp_min = 0;
 var timestamp_max = 0;
+
+var process_name_local = d3.local();
+var brush_local = d3.local();
+
+var target_frame_duration = 1/90;
 
 var vbox = document.getElementById('traces-vbox');
 
@@ -42,7 +45,7 @@ var svg_width_px = 1024;
 var svg_height_px = 1024;
 var svg_trace_width = function () { return svg_width_px - left_margin; };
 
-var levels_per_trace = 5;
+var levels_per_trace = 2;
 
 function pick_timestamp_formatter(ref)
 {
@@ -74,7 +77,7 @@ var x = d3.scaleLinear()
     .range([0, svg_trace_width()]);
 var y = d3.scaleLinear()
     .domain([0, 10])
-    .range([0, 300]);
+    .range([0, 200]);
 
 
 function string_to_number(str)
@@ -179,8 +182,7 @@ function process_task_samples(thread, task_descriptions)
                     start_time: start_sample.timestamp,
                     end_time: sample.timestamp,
                     task: task_descriptions[sample.task],
-                    stack_depth: stack.length
-
+                    stack_depth: stack.length - 1,
                 };
 
                 if (!task_sample.task)
@@ -220,7 +222,7 @@ var traces_xaxis = d3.axisBottom()
     //UPDATE
     var trace_svgs_update = d3.select('#traces-vbox')
         .selectAll('.thread-trace')
-        .data(threads, function (d) { return d.name; });
+        .data(threads, function (d) { return d.thread_name; });
 
     //EXIT
     trace_svgs_update.exit().remove();
@@ -243,7 +245,9 @@ var traces_xaxis = d3.axisBottom()
     //UPDATE + ENTER
     var trace_svgs_all = trace_svgs_new.merge(trace_svgs_update)
         .attr("width", svg_trace_width())
-        .attr("height", svg_height_px);
+        .attr("height", y(levels_per_trace))
+        .attr('x', 0)
+        .attr('y', function (d, i) { return y(i * levels_per_trace); });
 /*
     var view_domain = widget_x.domain();
 
@@ -261,26 +265,22 @@ var traces_xaxis = d3.axisBottom()
         .attr("class", "thread-name")
         .attr('width', left_margin)
         .attr('height', '1em')
-        .attr('x', 0)
-        .attr('y', function (d, i) { return y(i * levels_per_trace); })
         .attr('dominant-baseline', 'hanging')
         .text((d) => { 
-            return d.name;
+            return d.thread_name;
         });
-
+/*
     var trace_labels_new = trace_svgs_new
         .append('svg')
         .append('text')
         .attr("class", "thread-name")
         .attr('width', left_margin)
         .attr('height', '1em')
-        .attr('x', 0)
-        .attr('y', function (d, i) { return y(i * levels_per_trace); })
         .attr('dominant-baseline', 'hanging')
         .text((d) => { 
-            return d.name;
+            return d.thread_name;
         });
-
+*/
     // 
     // Flame graph, task boxes...
     // ===========================
@@ -311,7 +311,9 @@ var traces_xaxis = d3.axisBottom()
             }
 
             return filtered_tasks;
-        });
+        },
+        function (d) { return d.start_time; } //key
+        );
 
     //EXIT
     task_boxes_update.exit().remove();
@@ -324,6 +326,9 @@ var traces_xaxis = d3.axisBottom()
     task_boxes_new
         .append('rect');
 
+    task_boxes_new
+        .append('text')
+        .attr('dominant-baseline', 'hanging');
 
     // Flame graph task box, background rectangle...
     //
@@ -351,6 +356,8 @@ var traces_xaxis = d3.axisBottom()
         })
         .attr('height', function (d) { return y(1) });
 
+    //task_boxes_all.select('text')
+    //    .text(function (d) { return d.task.name; });
 
     
     /*
@@ -410,33 +417,41 @@ function cut_tasks_before(timestamp) {
     }
 }
 
+
+/*
+ * Throttle brush zooming to ~10fps otherwise it'll easily hang/DOS your
+ * machine.
+ */
+var brush_update_queued = false;
+var brush_queued_move = null;
+
+function queue_brush_update() {
+    if (brush_update_queued)
+        return;
+
+    brush_update_queued = true;
+    window.setTimeout(function () {
+
+        if (brush_queued_move !== null) {
+            var fn = brush_queued_move;
+            brush_queued_move = null;
+            fn();
+        }
+
+        // clear afterwards, so if handling the
+        // brush update is very slow then we don't
+        // want to pile up updates faster than
+        // we can handle them...
+        brush_update_queued = false;
+    }, 100);
+}
+
 d3.json('trace.json', function(data) {
 
     threads = [];
 
     var vbox = d3.select('#traces-vbox')
         .html("");
-
-    //widget for selecting the part of the trace to focus on
-    var selector_widget = vbox.append('svg')
-        .attr("width", svg_trace_width())
-        .attr("height", 30)
-        .attr("x", left_margin);
-        //.style('flex', 1);
-
-    selector_widget
-        .append('rect')
-        .style('fill', 'lightgrey')
-        .attr('width', svg_trace_width())
-        .attr('height', function (d) { return y(1) });
-    selector_widget.on('click', () => {
-        console.log("click");
-    });
-
-    selector_widget
-        .append("g")
-        .attr("class", "brush")
-        .call(brush);
 
     for (var i = 0; i < data.length; i++) {
         var thread = data[i];
@@ -448,6 +463,10 @@ d3.json('trace.json', function(data) {
             console.log("skipping thread with no samples\n");
             continue;
         }
+
+        if (thread.thread_name !== "hellovr"
+            && thread.thread_name !== "LighthouseDirec")
+            continue;
 
         //x.domain(d3.extent(thread.samples, function(d) { return d.timestamp; }));
         //y.domain([0, d3.max(thread.samples, function(d) { return d.stack_depth; })]);
@@ -467,9 +486,9 @@ d3.json('trace.json', function(data) {
     /* We don't want to be juggling too much data, and the UI isn't designed
      * to navigate too large a data set...
      */
-    if (timestamp_max > 1.0) {
-        cut_tasks_before(timestamp_max - 1.0);
-        timestamp_max = 1.0;
+    if (timestamp_max > 0.5) {
+        cut_tasks_before(timestamp_max - 0.5);
+        timestamp_max = 0.5;
     }
 
     /* FIXME the axis needs to be updated if the window resizes */
@@ -479,6 +498,119 @@ d3.json('trace.json', function(data) {
 
     x.range([0, svg_trace_width()]);
     widget_x.range([0, svg_trace_width()]);
+
+
+    //widget for selecting the part of the trace to focus on
+    var selector_widget = vbox.append('svg')
+        .attr("width", svg_trace_width())
+        .attr("height", 30)
+        .attr("x", left_margin);
+        //.style('flex', 1);
+
+    //
+    // Bars delimiting frames in top selector widget...
+    //
+    
+    //UPDATE
+    var selector_bars_update = selector_widget.selectAll('.frame-bar')
+        .data(
+            d3.range(widget_x.domain()[0],
+                     widget_x.domain()[1],
+                     target_frame_duration)
+        );
+
+    //EXIT
+    selector_bars_update.exit().remove();
+
+    //ENTER
+    var selector_bars_new = selector_bars_update.enter()
+        .append('rect')
+        .attr('class', 'frame-bar')
+        .attr('width', widget_x(target_frame_duration))
+        .attr('height', 30)
+        .attr('x', function (d) {
+            return widget_x(d);
+        })
+        .style('fill', function (d, i) {
+            return i%2 ? 'lightgrey': 'darkgrey';
+        });
+
+
+    //UPDATE + ENTER
+    //var selector_bars_all = selector_bars_new.merge(selector_bars_update)
+
+
+    var selector_brush_grp = selector_widget
+        .append("g")
+        .attr("class", "brush")
+
+    var selector_brush = selector_brush_grp
+        .call(brush);
+        //.select('g');
+
+    selector_widget//.select('.overlay')
+        //.each(function () {
+        //    console.log("WTF\n");            
+        //    brush_local.set(this, brush);
+        //})
+        .on('wheel', function (d) {
+
+            var e = d3.event;
+
+            //Grrr, getting back to a brush so that d3.brushSelection() can be
+            //used is a F'ing pain - just punching through and accessing
+            //the internal _groups array - this is just horrible though.
+            var sel = d3.brushSelection(selector_brush._groups[0][0]);
+
+            if (sel === null) {
+                console.log("scroll with no brush selection");
+                return;
+            }
+            var current_domain = x.domain();
+            
+            var dir = e.deltaY > 0 ? "down": "up";
+
+            var range = sel[1] - sel[0];
+            var half_range = range / 2;
+
+            var x0 = sel[0];
+            var x1 = sel[1];
+
+            if (e.clientX > sel[0] && e.clientX < sel[1]) {
+                console.log("scroll " + dir + " in brush");
+                var mid = sel[0] + half_range;
+                var factor = e.shiftKey ? 0.99 : 0.9;
+                var new_half_range = half_range * Math.pow(factor, e.deltaY);
+
+                x0 = mid - new_half_range;
+                x1 = mid + new_half_range;
+            } else if (e.clientX < sel[0]) {
+                console.log("scroll " + dir + " left of brush");
+                var factor = e.shiftKey ? 0.01 : 0.1;
+                var dx = half_range * factor * e.deltaY;
+                x0 += dx;
+                x1 += dx;
+            } else {
+                console.log("scroll " + dir + " right of brush");
+                var factor = e.shiftKey ? 0.01 : 0.1;
+                var dx = half_range * factor * e.deltaY;
+                x0 += dx;
+                x1 += dx;
+            }
+
+            var x0 = Math.max(widget_x.range()[0], x0);
+            var x1 = Math.min(widget_x.range()[1], x1);
+
+            brush_queued_move = function () {
+                console.log("throttled brush move\n");
+                brush.move(selector_brush, [x0, x1]);
+            };
+
+            queue_brush_update();
+            console.log("wheel");
+            d3.event.preventDefault();
+        }, false /* capture */);
+
 
     vbox.append('svg')
         //.style('flex', 1)
