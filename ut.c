@@ -1,7 +1,7 @@
 /*
- * libut - userspace tracing library
+ * libut - Userspace Tracing Toolkit
  *
- * Copyright (C) 2014 Intel Corporation
+ * Copyright (C) 2018 Robert Bragg
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -21,6 +21,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
+
 
 #define _GNU_SOURCE
 
@@ -71,6 +72,10 @@ ssize_t ut_real_sendmsg(int sockfd, const void * msg, int flags);
 ssize_t ut_real_recvmsg(int socket, void * msg, int flags);
 
 
+struct task_stack_entry {
+    uint16_t task_desc_idx;
+    uint64_t start_time;
+};
 
 struct thread_state {
     /* A stack of uint16_t task_desc indices */
@@ -211,7 +216,7 @@ get_thread_state(void)
         fprintf(stderr, "allocate thread state\n");
         state = xmalloc0(sizeof(*state));
         array_init(&state->task_desc_registry, sizeof(void *), 50);
-        array_init(&state->stack, sizeof(uint16_t), 50);
+        array_init(&state->stack, sizeof(struct task_stack_entry), 50);
         pthread_setspecific(tls_key, state);
 
         state->buf_size = UT_CIRCULAR_BUFFER_SIZE;
@@ -305,13 +310,14 @@ read_monotonic_clock(void)
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
-static void
-_task_sample(struct thread_state *state,
-             enum ut_sample_type type,
-             uint16_t task_desc_index)
+static struct ut_sample *
+_emit_task_sample(struct thread_state *state,
+                  enum ut_sample_type type,
+                  uint16_t task_desc_index)
 {
+    volatile struct ut_info_page *info = state->info;
     struct ut_sample *sample;
-    uint32_t offset = state->info->n_samples_written * sizeof(struct ut_sample);
+    uint32_t offset = info->n_samples_written * sizeof(struct ut_sample);
     uint32_t mask = (UT_CIRCULAR_BUFFER_SIZE - 1);
     uint32_t cpuid;
 
@@ -340,7 +346,7 @@ _task_sample(struct thread_state *state,
 
     /* ensure the sample only becomes visible after the contents have landed */
     mb();
-    state->info->n_samples_written++;
+    info->n_samples_written++;
 
     /* XXX: this is designed with the assumption that the clients are stopped
      * via ptrace(PTRACE_INTERRUPT) before data is read. The memory barrier
@@ -349,6 +355,36 @@ _task_sample(struct thread_state *state,
      * when the buffer is full since the interrupted client might have been in
      * the middle of writing a new sample.
      */
+
+    return sample;
+}
+
+static struct ut_sample *
+_emit_task_backtrace(struct thread_state *state)
+{
+    volatile struct ut_info_page *info = state->info;
+    struct ut_sample *sample;
+    uint32_t offset = info->n_samples_written * sizeof(struct ut_sample);
+    uint32_t mask = (UT_CIRCULAR_BUFFER_SIZE - 1);
+
+    offset &= mask;
+    sample = (void *)(state->buf + offset);
+    sample->type = UT_SAMPLE_TASK_BACKTRACE;
+    sample->padding = 0;
+    backtrace(sample->backtrace, ARRAY_SIZE(sample->backtrace));
+
+    mb();
+    info->n_samples_written++;
+
+    /* XXX: this is designed with the assumption that the clients are stopped
+     * via ptrace(PTRACE_INTERRUPT) before data is read. The memory barrier
+     * only ensures that the reader can trust that the most recent sample is
+     * consistent. On the other hand the reader should skip the oldest sample
+     * when the buffer is full since the interrupted client might have been in
+     * the middle of writing a new sample.
+     */
+
+    return sample;
 }
 
 static uint16_t
@@ -402,20 +438,45 @@ ut_push_task(struct ut_task_desc *task_desc)
 {
     struct thread_state *state = get_thread_state();
     uint16_t task_desc_idx = get_task_desc_index(state, task_desc);
+    struct ut_task_sample *sample;
+    struct task_stack_entry entry;
 
-    array_append_val(&state->stack, uint16_t, task_desc_idx);
-    _task_sample(state, UT_SAMPLE_TASK_PUSH, task_desc_idx);
+    sample = _emit_task_sample(state, UT_SAMPLE_TASK_PUSH, task_desc_idx);
+
+    entry->start_time = sample->timestamp;
+    entry->task_desc_idx = task_desc_idx;
+    array_append_val(&state->stack, struct task_stack_entry, entry);
 }
 
 void
 ut_pop_task(struct ut_task_desc *task_desc)
 {
     struct thread_state *state = get_thread_state();
+    struct ut_info_page *info = state->info;
     uint16_t task_desc_idx = get_task_desc_index(state, task_desc);
+    struct ut_task_sample *sample;
 
-    _task_sample(state, UT_SAMPLE_TASK_POP, task_desc_idx);
+    dbg_assert(array_element_at(&state->stack,
+                                struct task_stack_entry,
+                                state->stack.len - 1)->task_desc_idx == task_desc_idx);
 
-    dbg_assert(array_value_at(&state->stack, uint16_t, state->stack.len - 1) == task_desc_idx);
+    sample = _emit_task_sample(state, UT_SAMPLE_TASK_POP, task_desc_idx);
+
+    /* Only emit a backtrace at the end of a task, if it's duration
+     * was > info->backtrace_delta_threshold, as a way to minimize
+     * the associated overhead...
+     */
+    if (info->backtrace_n_frames) {
+        struct task_stack_entry *top = array_element_at(state->stack,
+                                                        struct task_stack_entry,
+                                                        state->stack.len - 1);
+        uint64_t delta = sample->timestamp - top->timestamp;
+
+        if (delta > info->backtrace_delta_threashold)
+            _emit_task_backtrace();
+    }
+
+
     array_remove_fast(&state->stack, state->stack.len - 1);
 }
 

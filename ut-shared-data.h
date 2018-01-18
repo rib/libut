@@ -35,29 +35,46 @@ struct ut_info_page {
 enum ut_sample_type {
     UT_SAMPLE_TASK_PUSH = 1,
     UT_SAMPLE_TASK_POP,
+    UT_SAMPLE_TASK_BACKTRACE
 };
 
-/* Note: all samples in the circular buffer have the same size which allows
- * us to safely overwrite old data without damaging loosing the integrity
- * of the data.
+#define MAX_BACKTRACE_SIZE 10
+
+/* Note: all samples in the circular buffer have the same size which allows us
+ * to safely overwrite old data without damaging the integrity of old
+ * samples.
+ *
+ * XXX: consider tracking a negative offset for being able to iterate through
+ * samples in reverse order. This way the consumer would have to first iterate
+ * backwards from the tail to find the head, but we could have variable sized
+ * records without needing to worry about synchronizing head pointer updates.
+ *
+ *  Note: with the above, we'd have to define a maximum sample size so that
+ * the comsumer would also skip over this much head data which the client
+ * may have been in the middle of overwritting.
  */
 struct ut_sample {
     uint16_t type;
 
-    /* A various tasks are described via side-band anciallary data buffers
-     * and this is just the index into that ancillary array of task
-     * descriptions */
-    uint16_t task_desc_index;
+    union {
+        struct {
+            /* A various tasks are described via side-band anciallary data buffers
+             * and this is just the index into that ancillary array of task
+             * descriptions */
+            uint16_t task_desc_index;
 
-    /* Tracking the stack size in samples accounts for having an incomplete
-     * record of push/pop samples once the buffer starts being overwritten
-     */
-    uint16_t stack_pointer;
-    uint8_t cpu;
-    uint8_t padding;
+            /* Tracking the stack size in samples accounts for having an incomplete
+             * record of push/pop samples once the buffer starts being overwritten
+             */
+            uint16_t stack_pointer;
+            uint8_t cpu;
+            uint8_t padding;
 
-    //uint64_t tsc;
-    uint64_t timestamp;
+            //uint64_t tsc;
+            uint64_t timestamp;
+        };
+        void *addresses[MAX_BACKTRACE_SIZE];
+    };
 } __attribute__((aligned(8)));
 
 

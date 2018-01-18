@@ -1,7 +1,7 @@
 /*
- * libut - userspace tracing library
+ * libut - Userspace Tracing Toolkit
  *
- * Copyright (C) 2014 Intel Corporation
+ * Copyright (C) 2018 Robert Bragg
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -21,6 +21,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
+
 
 #pragma once
 

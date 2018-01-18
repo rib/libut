@@ -10,17 +10,11 @@
  * - test with trace that has multiple stack frames
  * - test with trace that has multiple processes and threads
  * - 'def' task labels and then 'use' as needed
- * - find a way of clipping labels
- * - click and drag on top widget to focus on subset of trace
- * - top widget should visualize the selected region
  * - hook up resize callback and test
- * - top widget scale should cover full data set
  * - show 16ms or 11ms guides in top widget for 60/90fps rendering
  * - implement more system api wrappers
- *      - poll
- *      - select
- *      - epoll_wait
  *      - malloc (only larger allocations)
+ * - cull tiny/brief tasks
  */
 
 var threads = [];
@@ -192,8 +186,11 @@ function process_task_samples(thread, task_descriptions)
 
                 task_samples.push(task_sample);
 
-                if (sample.timestamp > timestamp_max)
-                    timestamp_max = sample.timestamp;
+                if (sample.timestamp > thread.timestamp_max)
+                    thread.timestamp_max = sample.timestamp;
+
+                if (start_sample.timestamp < thread.timestamp_min)
+                    thread.timestamp_min = start_sample.timestamp;
 
                 /*  XXX: Hack */
                 //if (task_samples.length >= 10)
@@ -310,6 +307,8 @@ var traces_xaxis = d3.axisBottom()
                 }
             }
 
+            console.log("filtered " + thread_obj.task_samples.length +  " tasks down to " + filtered_tasks.length + " tasks for thread = " + thread_obj.thread_name);
+
             return filtered_tasks;
         },
         function (d) { return d.start_time; } //key
@@ -356,8 +355,14 @@ var traces_xaxis = d3.axisBottom()
         })
         .attr('height', function (d) { return y(1) });
 
-    //task_boxes_all.select('text')
-    //    .text(function (d) { return d.task.name; });
+    task_boxes_all.select('text')
+        .text(function (d) {
+            var width = x(d.end_time) - x(d.start_time);
+            if (width > 50)
+                return d.task.name;
+            else
+                return "...";
+        });
 
     
     /*
@@ -398,10 +403,13 @@ function brush_ended() {
 
 function cut_tasks_before(timestamp) {
 
+    console.log("clipping anything before " + timestamp);
     for (var i = 0; i < threads.length; i++) {
         var thread = threads[i];
         var thread_tasks = thread.task_samples;
         var clipped_tasks = [];
+
+        console.log("clipping thread with timestamp range: " + thread.timestamp_min + " to " + thread.timestamp_max);
 
         for (var j = 0; j < thread_tasks.length; j++) {
             var task = thread_tasks[j];
@@ -413,6 +421,7 @@ function cut_tasks_before(timestamp) {
             }
         }
 
+        console.log("clipped " + thread.task_samples.length + " tasks down to " + clipped_tasks.length + " tasks for thread = " + thread.thread_name);
         thread.task_samples = clipped_tasks;
     }
 }
@@ -468,6 +477,9 @@ d3.json('trace.json', function(data) {
             && thread.thread_name !== "LighthouseDirec")
             continue;
 
+        thread.timestamp_min = Number.MAX_VALUE;
+        thread.timestamp_max = 0;
+
         //x.domain(d3.extent(thread.samples, function(d) { return d.timestamp; }));
         //y.domain([0, d3.max(thread.samples, function(d) { return d.stack_depth; })]);
 
@@ -479,17 +491,21 @@ d3.json('trace.json', function(data) {
             continue;
         }
 
+        if (thread.timestamp_max > timestamp_max)
+            timestamp_max = thread.timestamp_max;
+
         threads.push(thread);
         console.log("read samples for process = \"" + thread.name + "\", thread = \"" + thread.thread_name + "\"\n");
+        console.log("> timestamp range is " + thread.timestamp_min + " to " + thread.timestamp_max);
     }
 
     /* We don't want to be juggling too much data, and the UI isn't designed
      * to navigate too large a data set...
      */
-    if (timestamp_max > 0.5) {
-        cut_tasks_before(timestamp_max - 0.5);
-        timestamp_max = 0.5;
-    }
+    //if (timestamp_max > 0.5) {
+    //    cut_tasks_before(timestamp_max - 0.5);
+    //    timestamp_max = 0.5;
+   // }
 
     /* FIXME the axis needs to be updated if the window resizes */
     x.domain([0, timestamp_max]);

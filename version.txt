@@ -11,6 +11,8 @@ GLIBC_2.2.5 {
         send;
         sendto;
         sendmsg;
+        recv;
+        recvfrom;
         recvmsg;
         pthread_mutex_lock;
         pthread_mutex_trylock;

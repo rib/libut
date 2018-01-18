@@ -1,32 +1,5 @@
 #!/usr/bin/env python
 
-#void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
-#int open(const char *pathname, int flags, mode_t mode);
-#ssize_t read(int fd, void *buf, size_t count);
-#ssize_t write(int fd, const void *buf, size_t count);
-#int ioctl(int fd, unsigned long request, void *data);
-#int nanosleep(const struct timespec *rqtp, struct timespec *rmtp);
-#void *malloc(size_t size)
-#void free(void *ptr)
-#void *calloc(size_t nmemb, size_t size)
-#void *realloc(void *ptr, size_t size)
-#ssize_t send(int sockfd, const void *buf, size_t len, int flags);
-#ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
-#       const struct sockaddr *dest_addr, socklen_t addrlen);
-#ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags);
-#ssize_t recvmsg(int socket, struct msghdr *message, int flags);
-#int pthread_mutex_lock(pthread_mutex_t *mutex);
-#int pthread_mutex_trylock(pthread_mutex_t *mutex);
-#int pthread_mutex_unlock(pthread_mutex_t *mutex);
-#int pthread_cond_wait(pthread_cond_t * restrict cond
-#                        pthread_mutex_t * restrict mutex);
-#XXX: note the pthread_cond_ apis have LinuxThreads vs NPTL versions
-#int pthread_cond_timedwait(pthread_cond_t * restrict cond
-#                        pthread_mutex_t * restrict mutex,
-#                        const struct timespec * restrict abstime);
-#int pthread_cond_signal(pthread_cond_t *cond);
-#int pthread_cond_broadcastpthread_cond_t *cond);
-
 apis = [
     {
         "name": "mmap",
@@ -116,6 +89,28 @@ apis = [
         "ret": 'ssize_t'
     },
     {
+        "name": "recv",
+        "args": [
+            [ 'int', 'socket' ],
+            [ 'void *', 'buf' ],
+            [ 'size_t', 'len' ],
+            [ 'int', 'flags' ],
+        ],
+        "ret": 'ssize_t'
+    },
+    {
+        "name": "recvfrom",
+        "args": [
+            [ 'int', 'socket' ],
+            [ 'void * restrict', 'buf' ],
+            [ 'size_t', 'len' ],
+            [ 'int', 'flags' ],
+            [ 'void * restrict', 'addr' ],
+            [ 'int * restrict', 'addr_len' ],
+        ],
+        "ret": 'ssize_t'
+    },
+    {
         "name": "recvmsg",
         "args": [
             [ 'int', 'socket' ],
@@ -145,6 +140,8 @@ apis = [
         ],
         "ret": 'int'
     },
+
+    #XXX: note the pthread_cond_ apis have LinuxThreads vs NPTL versions
     {
         "name": "pthread_cond_wait",
         "args": [
@@ -181,28 +178,70 @@ apis = [
         "versions": [ "GLIBC_2.2.5", "GLIBC_2.3.2" ]
     },
 
+    {
+        "name": "poll",
+        "args": [
+            [ 'void *', 'fds' ],
+            [ 'unsigned long', 'nfds' ],
+            [ 'int', 'timeout' ],
+        ],
+        "ret": 'int',
+    },
+    {
+        "name": "ppoll",
+        "args": [
+            [ 'void *', 'fds' ],
+            [ 'unsigned long', 'nfds' ],
+            [ 'void *', 'tmo_p' ],
+            [ 'void *', 'sigmask' ],
+        ],
+        "ret": 'int',
+    },
+    {
+        "name": "epoll_wait",
+        "args": [
+            [ 'int', 'epfd' ],
+            [ 'void *', 'events' ],
+            [ 'int', 'maxevents' ],
+            [ 'int', 'timeout' ],
+        ],
+        "ret": 'int',
+    },
+    {
+        "name": "epoll_pwait",
+        "args": [
+            [ 'int', 'epfd' ],
+            [ 'void *', 'events' ],
+            [ 'int', 'maxevents' ],
+            [ 'int', 'timeout' ],
+            [ 'void *', 'sigmask' ],
+        ],
+        "ret": 'int',
+    },
+    {
+        "name": "select",
+        "args": [
+            [ 'int', 'nfds' ],
+            [ 'fd_set * restrict', 'readfds' ],
+            [ 'fd_set * restrict', 'writefds' ],
+            [ 'fd_set * restrict', 'errorfds' ],
+            [ 'struct timeval * restrict', 'timeout' ],
+        ],
+        "ret": 'int',
+    },
+    {
+        "name": "pselect",
+        "args": [
+            [ 'int', 'nfds' ],
+            [ 'fd_set * restrict', 'readfds' ],
+            [ 'fd_set * restrict', 'writefds' ],
+            [ 'fd_set * restrict', 'errorfds' ],
+            [ 'const struct timespec * restrict', 'timeout' ],
+            [ 'const sigset_t *', 'sigmask' ],
+        ],
+        "ret": 'int',
+    },
 ]
-
-whitelist = [
-    "mmap",
-    "open",
-    "read",
-    "write",
-    "ioctl",
-    "nanosleep",
-    "send",
-    "sendto",
-    "sendmsg",
-    "recvmsg",
-    "pthread_mutex_lock",
-    "pthread_mutex_trylock",
-    "pthread_mutex_unlock",
-    "pthread_cond_wait",
-    "pthread_cond_timedwait",
-    "pthread_cond_signal",
-    "pthread_cond_broadcast",
-]
-
 
 def emit_wrapper(func, symname, ver=None):
     if 'ret' in func:
@@ -260,8 +299,28 @@ def emit_wrapper(func, symname, ver=None):
     print("")
 
 
+print("#define _GNU_SOURCE")
+print("#include <sys/types.h>")
+print("#include <dlfcn.h>")
+print("")
+print("#include \"ut-shared-data.h\"")
+print("")
+print("/* AUTOMATICALLY GENERATED; DO NOT EDIT */")
+print("")
+print("")
+print("#define unlikely(x) __builtin_expect(x, 0)")
+print("")
+print("void load_libut(void);")
+print("")
+print("extern void (*ut_push_task_ptr)(struct ut_task_desc *task_desc);")
+print("extern void (*ut_pop_task_ptr)(struct ut_task_desc *task_desc);")
+print("")
+print("")
+print("")
+
+
 for func in apis:
-    if func['name'] not in whitelist:
+    if 'skip' in func and func['skip'] == True:
         continue
 
     if "versions" in func:
@@ -273,7 +332,7 @@ for func in apis:
 
 
 for func in apis:
-    if func['name'] not in whitelist:
+    if 'skip' in func and func['skip'] == True:
         continue
 
     if "versions" not in func:
@@ -286,5 +345,5 @@ for func in apis:
             sep = "@"
         else:
             sep = "@@"
-        print('asm(".symver ' + vername + ', ' + func['name'] + sep + ver + '");')
+        print('__asm__(".symver ' + vername + ', ' + func['name'] + sep + ver + '");')
         first = False
