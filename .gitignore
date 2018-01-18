@@ -1,0 +1,8 @@
+*.swp
+*.o
+*.lo
+*.so
+*.so.1
+Makefile.in
+.deps
+.dirstamp
